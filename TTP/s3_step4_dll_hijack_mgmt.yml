@@ -1,0 +1,113 @@
+- name: 'Scenario 3 - Pipeline Breach: DLL Hijacking via CorpMonitor Service and LSASS Credential Dump (MGMT)'
+  description: >-
+    Simulates abuse of a writable service installation path on the Windows
+    management server to hijack application loading behaviour and obtain
+    SYSTEM-level execution. The target service, CorpMonitor, runs in a privileged
+    context and presents an opportunity for DLL search-order or side-loading abuse
+    when low-privilege users can modify files in its program directory. In the
+    intended attack chain, this access is then used to inspect LSASS-resident
+    credentials for the operations account that administers core domain services.
+    Relevant defensive telemetry would include file modification within the service
+    directory, service start or restart activity, abnormal module loads, and
+    subsequent credential-access behaviour.
+  tactic: privilege-escalation
+  technique_id: T1574.001
+  technique_name: 'Hijack Execution Flow: DLL Search Order Hijacking'
+  singleton: false
+  repeatable: false
+  delete_payload: false
+  executors:
+  - name: psh
+    platform: windows
+    command: |-
+      $ErrorActionPreference = "SilentlyContinue"
+
+      Write-Host "[*] Inspecting MGMT service-hijack and LSASS prerequisites" -ForegroundColor Cyan
+
+      Write-Host "`n[*] CorpMonitor service state" -ForegroundColor Yellow
+      Get-Service CorpMonitor -ErrorAction SilentlyContinue |
+        Select-Object Name, Status, StartType |
+        Format-Table -AutoSize | Out-String | Write-Host
+
+      Write-Host "`n[*] CorpMonitor directory contents" -ForegroundColor Yellow
+      Get-ChildItem "C:\Program Files\CorpMonitor" -Force -ErrorAction SilentlyContinue |
+        Select-Object Name, Length, LastWriteTime |
+        Format-Table -AutoSize | Out-String | Write-Host
+
+      Write-Host "`n[*] Writable ACL review" -ForegroundColor Yellow
+      (Get-Acl "C:\Program Files\CorpMonitor" -ErrorAction SilentlyContinue).Access |
+        Where-Object { $_.IdentityReference -match "Domain Users|ansible_svc" } |
+        Select-Object IdentityReference, FileSystemRights, AccessControlType, IsInherited |
+        Format-Table -AutoSize | Out-String | Write-Host
+
+      Write-Host "`n[*] Scheduled task carrying svc_itops context" -ForegroundColor Yellow
+      Get-ScheduledTask -TaskName "ITOpsMonitor" -ErrorAction SilentlyContinue |
+        Select-Object TaskName, State, TaskPath |
+        Format-Table -AutoSize | Out-String | Write-Host
+      Get-ScheduledTaskInfo -TaskName "ITOpsMonitor" -ErrorAction SilentlyContinue |
+        Select-Object LastRunTime, LastTaskResult, NextRunTime |
+        Format-Table -AutoSize | Out-String | Write-Host
+
+      Write-Host "`n[*] Local Administrators membership check for ansible_svc" -ForegroundColor Yellow
+      Get-LocalGroupMember Administrators -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match "ansible_svc" } |
+        Select-Object Name, PrincipalSource |
+        Format-Table -AutoSize | Out-String | Write-Host
+
+      Write-Host "`n[*] LSASS-related protection settings" -ForegroundColor Yellow
+      Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name RunAsPPL -ErrorAction SilentlyContinue |
+        Select-Object RunAsPPL | Format-List | Out-String | Write-Host
+      Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\WDigest" -Name UseLogonCredential -ErrorAction SilentlyContinue |
+        Select-Object UseLogonCredential | Format-List | Out-String | Write-Host
+      Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name LocalAccountTokenFilterPolicy -ErrorAction SilentlyContinue |
+        Select-Object LocalAccountTokenFilterPolicy | Format-List | Out-String | Write-Host
+    code: null
+    language: null
+    build_target: null
+    payloads: []
+    uploads: []
+    timeout: 300
+    parsers: []
+    cleanup: []
+    variations: []
+    additional_info:
+      target_host: MGMT.cyberange.local
+      target_ip_suffix: .50
+      domain: cyberange.local
+      initial_access:
+        method: WinRM (port 5985)
+        username: ansible_svc
+        password: 'Ans1bl3#Mgmt2025!'
+        local_admin: true
+      dll_hijack:
+        service_name: CorpMonitor
+        service_directory: 'C:\Program Files\CorpMonitor\'
+        target_dll: logger.dll
+        directory_acl: 'CYBERANGE\Domain Users — Modify (write files)'
+        service_runs_as: SYSTEM
+        load_trigger: Service restart or periodic 60-second timer
+      lsass_conditions:
+        RunAsPPL: 0
+        CredentialGuard: disabled
+        WDigest_UseLogonCredential: 1
+        LocalAccountTokenFilterPolicy: 1
+      cached_session:
+        task_name: ITOpsMonitor
+        account: 'CYBERANGE\svc_itops'
+        logon_type: 4 (Batch)
+        significance: Domain Admin + DnsAdmins member
+      extracted_account:
+        username: svc_itops
+        password: 'ITops#Adm1n2025!'
+        groups:
+          - Domain Admins
+          - DnsAdmins
+        significance: Enables DNSAdmin abuse in Step 5
+      detection_events:
+        - '4624 - WinRM logon for ansible_svc'
+        - '4688 - Process creation: file drop to CorpMonitor directory'
+        - '7036/7045 - CorpMonitor service state change'
+        - 'Sysmon Event 7 - DLL loaded from C:\Program Files\CorpMonitor\logger.dll by service'
+        - 'Sysmon Event 10 - LSASS process memory access'
+  requirements: []
+  id: b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9

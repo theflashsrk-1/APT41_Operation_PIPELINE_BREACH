@@ -1,0 +1,84 @@
+- name: 'Scenario 3 - Pipeline Breach: Blind SQL Injection on Flask Inventory App (LNXW)'
+  description: >-
+    Simulates initial compromise of the Linux web tier by targeting SQL injection
+    weaknesses in the Psychorp inventory application hosted on LNXW. The exposed
+    application stack combines Flask, MySQL, and a reverse-proxy front end, creating
+    a realistic business workflow through which an operator can enumerate backend
+    behaviour and recover stored deployment secrets from the database. This stage is
+    intended to resemble quiet, application-layer intrusion activity rather than
+    noisy exploitation, with likely defensive evidence in HTTP access patterns,
+    unusual query strings, and database activity tied to search or login endpoints.
+  tactic: initial-access
+  technique_id: T1190
+  technique_name: Exploit Public-Facing Application
+  singleton: false
+  repeatable: true
+  delete_payload: false
+  executors:
+  - name: sh
+    platform: linux
+    command: |-
+      echo "[*] Host context: $(hostname -f 2>/dev/null || hostname)"
+      echo
+      echo "[*] Service state:"
+      for svc in nginx mysql inventory-app; do
+        printf "%-20s" "$svc"
+        systemctl is-active "$svc" 2>/dev/null || echo "unknown"
+      done
+      echo
+      echo "[*] Listening ports of interest:"
+      ss -ltn 2>/dev/null | awk 'NR==1 || /:80 |:5000 |:3306 /'
+      echo
+      echo "[*] Flask route and query surface:"
+      grep -nE "@app\.route|/login|/search|/api/inventory|cursor\.execute|mysql\.connector" /opt/inventory-app/app.py 2>/dev/null | head -n 40
+      echo
+      echo "[*] Relevant file presence:"
+      ls -l /opt/inventory-app/app.py /etc/nginx/sites-available/inventory /etc/systemd/system/inventory-app.service 2>/dev/null
+    code: null
+    language: null
+    build_target: null
+    payloads: []
+    uploads: []
+    timeout: 300
+    parsers: []
+    cleanup: []
+    variations: []
+    additional_info:
+      target_host: LNXW.cyberange.local
+      target_ip_suffix: .20
+      domain: cyberange.local
+      application: Flask Inventory Management System
+      app_port: 80
+      app_backend_port: 5000
+      database: MySQL (inventory_app)
+      db_user: inventory_app
+      vulnerable_endpoints:
+        - path: /login
+          parameter: username
+          injection_type: Authentication bypass / Blind
+        - path: /search
+          parameter: q
+          injection_type: Time-based / Boolean blind
+        - path: '/api/inventory/<id>'
+          parameter: id (URL)
+          injection_type: Integer / Error-based
+      target_table: deploy_credentials
+      extracted_credentials:
+        - hostname: LNXBUILDER.cyberange.local
+          username: deploy_user
+          password: 'D3pl0y#2025!'
+          purpose: Automated build deployment
+        - hostname: LNXW.cyberange.local
+          username: www-deploy
+          password: 'W3bD3pl0y!2025'
+          purpose: Decoy — web application deployment
+        - hostname: LNXPROC.cyberange.local
+          username: proxy-admin
+          password: 'Pr0xy@dm1n2025'
+          purpose: Decoy — proxy configuration
+      detection_indicators:
+        - Nginx access logs — repeated requests to /search with SQL syntax characters
+        - Long response times from time-based blind injection (SLEEP() calls)
+        - MySQL slow query log entries
+  requirements: []
+  id: e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6

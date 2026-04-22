@@ -1,0 +1,84 @@
+- name: 'Scenario 3 - Pipeline Breach: Rsync Unauthenticated Write and Kerberos Keytab Extraction (LNXPROC)'
+  description: >-
+    Represents pivoting from a compromised Linux build host into a second internal
+    Linux server by abusing an rsync daemon that exposes writable system paths
+    without authentication. The target, LNXPROC, is domain-joined through
+    realmd/SSSD and maintains a machine-account keytab that can be leveraged for
+    further interaction with Active Directory once local root access is achieved.
+    This step reflects realistic post-exploitation behaviour in mixed
+    Linux/Windows estates where infrastructure services, configuration sync, and AD
+    integration intersect. Likely defensive evidence includes inbound rsync activity,
+    writes beneath sensitive configuration paths, and access to Kerberos material.
+  tactic: lateral-movement
+  technique_id: T1021
+  technique_name: Remote Services
+  singleton: false
+  repeatable: false
+  delete_payload: false
+  executors:
+  - name: sh
+    platform: linux
+    command: |-
+      echo "[*] Host context: $(hostname -f 2>/dev/null || hostname)"
+      echo
+      echo "[*] Service state:"
+      for svc in rsync sssd; do
+        printf "%-20s" "$svc"
+        systemctl is-active "$svc" 2>/dev/null || echo "unknown"
+      done
+      echo
+      echo "[*] Rsync daemon listener:"
+      ss -ltn 2>/dev/null | awk 'NR==1 || /:873 /'
+      echo
+      echo "[*] server-configs module snapshot:"
+      awk '
+        /^\[server-configs\]/ {show=1}
+        show==1 {print}
+        show==1 && /^\[/ && $0 !~ /^\[server-configs\]/ {exit}
+      ' /etc/rsyncd.conf 2>/dev/null | sed '$d'
+      echo
+      echo "[*] Kerberos realm snapshot:"
+      grep -nE "default_realm|kdc|admin_server|domain_realm" /etc/krb5.conf 2>/dev/null
+      echo
+      echo "[*] Keytab entries:"
+      klist -k /etc/krb5.keytab 2>/dev/null | head -n 20
+    code: null
+    language: null
+    build_target: null
+    payloads: []
+    uploads: []
+    timeout: 180
+    parsers: []
+    cleanup: []
+    variations: []
+    additional_info:
+      target_host: LNXPROC.cyberange.local
+      target_ip_suffix: .40
+      domain: cyberange.local
+      rsync_vulnerability:
+        port: 873
+        module_name: server-configs
+        module_path: /etc
+        read_only: false
+        auth_required: false
+        hosts_allow: '*'
+      exploitation_approach:
+        - Write SSH public key to /etc/ssh/ or /root/.ssh/authorized_keys
+        - Write cron job to /etc/cron.d/ for reverse shell
+        - Write sudoers entry to /etc/sudoers.d/
+      keytab_details:
+        path: /etc/krb5.keytab
+        contains: Machine account credentials for LNXPROC$@CYBERANGE.LOCAL
+        krb5_conf: /etc/krb5.conf
+        realm: CYBERANGE.LOCAL
+        dc_kdc: DC.cyberange.local
+      keytab_use:
+        technique: kinit with keytab or impacket with -keytab flag
+        grants: Kerberos TGT for LNXPROC$ machine account
+        ad_permissions: Standard machine account — domain enumeration, some LDAP reads
+      detection_events:
+        - '/var/log/rsyncd.log - unauthenticated write connection from attacker IP'
+        - 'Filesystem audit - new file created under /etc/'
+        - '/var/log/auth.log - escalated execution resulting from written payload'
+  requirements: []
+  id: a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8

