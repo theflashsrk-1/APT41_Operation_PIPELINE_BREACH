@@ -1,4 +1,4 @@
-- name: 'Scenario 3 - Pipeline Breach: Rsync Unauthenticated Write and Kerberos Keytab Extraction (LNXPROC)'
+- name: 'APT41 3 - Pipeline Breach: Rsync Unauthenticated Write and Kerberos Keytab Extraction (LNXPROC)'
   description: >-
     Represents pivoting from a compromised Linux build host into a second internal
     Linux server by abusing an rsync daemon that exposes writable system paths
