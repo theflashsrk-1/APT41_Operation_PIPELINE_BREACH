@@ -76,7 +76,7 @@ impacket-secretsdump 'cyberange.local/hacker:P@ssw0rd123!@DC.cyberange.local'
 
 ## Design Notes
 
-- This scenario is intentionally mixed-platform. The operator moves from an internet-facing Linux application, into Linux operations infrastructure, then into Windows administrative controls and finally Active Directory.
+- This range is intentionally mixed-platform. The operator moves from an internet-facing Linux application, into Linux operations infrastructure, then into Windows administrative controls and finally Active Directory.
 - The environment is designed to feel operationally plausible rather than “CTF-clean”: there are real-looking applications, automation vaults, config sync services, scheduled tasks, and service-account usage patterns.
 - The scripted trigger path is deterministic for replayability. Some secondary weaknesses remain present for realism and blue-team depth, but the documentation below reflects the route actually exercised by the supplied `Exploit.sh`.
 
