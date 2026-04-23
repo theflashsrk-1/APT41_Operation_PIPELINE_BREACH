@@ -1,4 +1,4 @@
-- name: 'Scenario 3 - Pipeline Breach: DNSAdmins Group Abuse for SYSTEM Execution on Domain Controller (DC)'
+- name: 'APT41 - Pipeline Breach: DNSAdmins Group Abuse for SYSTEM Execution on Domain Controller (DC)'
   description: >-
     Models a domain-controller escalation path based on misuse of delegated DNS
     administration rights rather than direct exploitation of the operating system.
