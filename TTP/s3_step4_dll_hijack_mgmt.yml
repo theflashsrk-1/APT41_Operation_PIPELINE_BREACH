@@ -1,4 +1,4 @@
-- name: 'Scenario 3 - Pipeline Breach: DLL Hijacking via CorpMonitor Service and LSASS Credential Dump (MGMT)'
+- name: 'APT41 - Pipeline Breach: DLL Hijacking via CorpMonitor Service and LSASS Credential Dump (MGMT)'
   description: >-
     Simulates abuse of a writable service installation path on the Windows
     management server to hijack application loading behaviour and obtain
