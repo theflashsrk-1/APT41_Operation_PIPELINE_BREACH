@@ -1,4 +1,4 @@
-- name: 'Scenario 3 - Pipeline Breach: Blind SQL Injection on Flask Inventory App (LNXW)'
+- name: 'APT41 - Pipeline Breach: Blind SQL Injection on Flask Inventory App (LNXW)'
   description: >-
     Simulates initial compromise of the Linux web tier by targeting SQL injection
     weaknesses in the Psychorp inventory application hosted on LNXW. The exposed
