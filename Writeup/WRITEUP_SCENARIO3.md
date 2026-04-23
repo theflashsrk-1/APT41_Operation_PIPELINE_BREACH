@@ -1,5 +1,5 @@
 # APT41 — Operation PIPELINE BREACH
-## Red Team Exercise Write-Up — Scenario 3
+## Red Team Exercise Write-Up — Range 3
 
 > **Classification:** RESTRICTED — Internal Red Team Use Only
 
@@ -716,5 +716,5 @@ sudo ./scripts/attack_chain_s3.sh
 ---
 
 > **END OF WRITE-UP**  
-> APT41 — Operation PIPELINE BREACH — Scenario 3  
+> APT41 — Operation PIPELINE BREACH — Range 3  
 > **RESTRICTED — Internal Red Team Use Only**
