@@ -1,4 +1,4 @@
-- name: 'Scenario 3 - Pipeline Breach: Tar Wildcard Injection Privilege Escalation and Ansible Vault Decryption (LNXBUILDER)'
+- name: 'APT41 - Pipeline Breach: Tar Wildcard Injection Privilege Escalation and Ansible Vault Decryption (LNXBUILDER)'
   description: >-
     Models privilege escalation on LNXBUILDER following SSH access to a deployment
     account with write permissions in the build workspace. The target system runs a
