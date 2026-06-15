@@ -7,7 +7,7 @@
 |---|---|
 | **Environment** | 3 × Ubuntu 22.04 &nbsp;\|&nbsp; 2 × Windows Server 2019 |
 | **Domain** | cyberange.local / CYBERANGE |
-| **Emulated Actor** | APT41 (Double Dragon / BARIUM / WICKED PANDA) |
+| **Actor** | APT41 (Double Dragon / BARIUM / WICKED PANDA) |
 | **Attack Chain** | SQLi → Tar Wildcard → Rsync → LSASS → DNSAdmin DLL → DCSync |
 | **End Goal** | Full Domain Compromise — DCSync of cyberange.local |
 
